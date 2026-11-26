@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  lint-and-validate:
+    name: Lint & Configuration Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare env file
+        run: cp .env.example .env
+
+      - name: Validate Docker Compose config
+        run: docker compose config -q
+
+      - name: Validate Prometheus syntax (promtool)
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v ${{ github.workspace }}/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro \
+            prom/prometheus:v2.55.1 check config /etc/prometheus/prometheus.yml
+
+      - name: Validate Telegraf configuration
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}/telegraf/telegraf.conf:/etc/telegraf/telegraf.conf:ro \
+            telegraf:1.33 telegraf config check --config /etc/telegraf/telegraf.conf
+
+  smoke-test:
+    name: End-to-End Stack & Metrics Verification
+    needs: lint-and-validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare env file
+        run: cp .env.example .env
+
+      - name: Start lab stack
+        run: docker compose up -d --build
+
+      - name: Start traffic generator
+        run: docker compose --profile load up -d loadgen
+
+      - name: Wait for services & metrics collection
+        run: |
+          echo "Waiting for stack initialization..."
+          sleep 25
+
+      - name: Verify Application through Nginx
+        run: |
+          curl -fsS http://localhost:8080/
+          curl -fsS http://localhost:8080/items
+
+      - name: Verify Prometheus targets health
+        run: |
+          STATUS=$(curl -fsS http://localhost:9090/api/v1/targets)
+          echo "$STATUS" | grep -q '"job":"telegraf"' || (echo "Target telegraf missing" && exit 1)
+          echo "$STATUS" | grep -q '"job":"app-direct"' || (echo "Target app-direct missing" && exit 1)
+
+      - name: Verify Telegraf unified metrics in Prometheus
+        run: |
+          # Verify HTTP app metrics scraped via Telegraf
+          curl -fsS "http://localhost:9090/api/v1/query?query=app_http_requests_total%7Bjob%3D%22telegraf%22%7D" | grep -q '"result":\s*\[{'
+          # Verify Nginx status metrics
+          curl -fsS "http://localhost:9090/api/v1/query?query=nginx_requests%7Bjob%3D%22telegraf%22%7D" | grep -q '"result":\s*\[{'
+          # Verify PostgreSQL metrics
+          curl -fsS "http://localhost:9090/api/v1/query?query=postgresql_numbackends%7Bjob%3D%22telegraf%22%7D" | grep -q '"result":\s*\[{'
+          # Verify Host CPU metrics
+          curl -fsS "http://localhost:9090/api/v1/query?query=cpu_usage_idle%7Bjob%3D%22telegraf%22%7D" | grep -q '"result":\s*\[{'
+
+      - name: Verify Grafana health
+        run: |
+          curl -fsS http://localhost:3001/api/health | grep -q '"database":"ok"'
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Teardown stack
+        if: always()
+        run: docker compose down -v

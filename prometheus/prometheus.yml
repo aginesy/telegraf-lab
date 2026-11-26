@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: telegraf
+    static_configs:
+      - targets: ["telegraf:9273"]
+
+  # Direct scrape of the app, to compare with the path through Telegraf
+  - job_name: app-direct
+    static_configs:
+      - targets: ["app:3000"]
